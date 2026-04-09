@@ -1,0 +1,90 @@
+name: Backend CI/CD → Railway
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Test ────────────────────────────────────────────────────────────────
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run tests
+        run: mvn verify -q
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: target/surefire-reports/
+
+  # ── Deploy (main branch only) ────────────────────────────────────────────
+  deploy:
+    name: Blue-Green Deploy
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Determine idle slot
+        id: slot
+        run: |
+          # Query current active slot from /api/info
+          ACTIVE=$(curl -sf ${{ secrets.PRODUCTION_URL }}/api/info | jq -r '.slot' || echo "blue")
+          IDLE=$([ "$ACTIVE" = "blue" ] && echo "green" || echo "blue")
+          echo "active=$ACTIVE" >> $GITHUB_OUTPUT
+          echo "idle=$IDLE"     >> $GITHUB_OUTPUT
+          echo "Active slot: $ACTIVE  →  Deploying to: $IDLE"
+
+      - name: Deploy to idle slot
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          IDLE=${{ steps.slot.outputs.idle }}
+          SERVICE_ID=$([ "$IDLE" = "blue" ] && echo "${{ secrets.RAILWAY_SERVICE_BLUE }}" || echo "${{ secrets.RAILWAY_SERVICE_GREEN }}")
+          railway up --service $SERVICE_ID --detach
+
+      - name: Wait for healthy
+        run: |
+          IDLE=${{ steps.slot.outputs.idle }}
+          IDLE_URL=${{ secrets.IDLE_SLOT_URL }}
+          echo "Waiting for $IDLE_URL to become healthy..."
+          for i in $(seq 1 24); do
+            STATUS=$(curl -sf "$IDLE_URL/actuator/health" | jq -r '.status' 2>/dev/null || echo "DOWN")
+            echo "Attempt $i: $STATUS"
+            [ "$STATUS" = "UP" ] && break
+            sleep 5
+          done
+          [ "$STATUS" = "UP" ] || (echo "Health check failed!" && exit 1)
+
+      - name: Smoke test idle slot
+        run: |
+          curl -sf ${{ secrets.IDLE_SLOT_URL }}/api/info | jq .
+
+      - name: Switch traffic to idle slot
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          # Update the Railway custom domain to point to the newly deployed service
+          IDLE=${{ steps.slot.outputs.idle }}
+          SERVICE_ID=$([ "$IDLE" = "blue" ] && echo "${{ secrets.RAILWAY_SERVICE_BLUE }}" || echo "${{ secrets.RAILWAY_SERVICE_GREEN }}")
+          railway domain --service $SERVICE_ID --set ${{ secrets.PRODUCTION_DOMAIN }}
+          echo "Traffic switched to $IDLE slot ✅"
